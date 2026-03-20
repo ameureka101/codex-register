@@ -161,11 +161,16 @@ class TempMailService(BaseEmailService):
 
     def _admin_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
-        return {
+        headers = {
             "x-admin-auth": self.config["admin_password"],
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        # 如果配置了站点密码（PASSWORDS），需要额外带上 x-custom-auth
+        site_password = self.config.get("site_password")
+        if site_password:
+            headers["x-custom-auth"] = site_password
+        return headers
 
     def _make_request(self, method: str, path: str, **kwargs) -> Any:
         """
