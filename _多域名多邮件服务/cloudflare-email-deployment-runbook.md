@@ -453,6 +453,8 @@ curl -s -X POST "https://gomail.【域名】/admin/new_address" \
 | 12 | **Workspace ID 间歇性获取失败** | Step 13 `授权 Cookie 里没有 workspace 信息`，间歇性出现 | **必须修复代码**，加重试机制，见下方详细说明 |
 | 13 | **PASSWORDS 拦截 Admin API** | 配了 `PASSWORDS` 后 Admin API 返回 `please provide the password` | codex-register 配置加 `site_password`，代码自动带 `x-custom-auth` header |
 | 14 | **前端未打包就部署** | 访问 `gomail.域名` 只返回 `OK`，没有界面 | 先 `cd frontend && pnpm build` 再 deploy Worker |
+| 15 | **同账号第二个域名跳过 Email Routing 配置** | 该域名之前配过 Email Routing 已是 Active，无需重新添加 MX/SPF/DKIM | 只需更新 Catch-all 规则指向新 Worker |
+| 16 | **custom_domain 路由创建被 API Token 拦截** | wrangler deploy 尾部报 `Authentication error [code: 10000]` | 用 Global API Key 手动 `POST /workers/routes` 创建，同时需手动加 `AAAA gomail.域名 -> 100::` DNS 记录 |
 
 ### 坑 #11 详解：JWT 无 exp 字段导致验证码获取永久失败
 
@@ -611,6 +613,65 @@ gcloud compute ssh codex-register --zone=us-west1-b --command='sudo systemctl re
 
 ---
 
+### guochunlin.com（2026-03-20）
+
+| 项目 | 值 |
+|------|-----|
+| Cloudflare 账号邮箱 | ameureka@webmail.spobcollege.edu（同 ppthub） |
+| Account ID | e08ccf48bda30edaeb5b89a399bb41cf（同 ppthub） |
+| Zone ID | 11e24c8b9e845f706a798b48dc01fc7b |
+| Worker 名称 | temp-email-guochunlin |
+| D1 数据库 ID | 6e939bb3-ff03-4b37-bd4d-b5acc09be608 |
+| 自定义域名 | gomail.guochunlin.com |
+| Admin 密码 | en5ysQdFsUhvhG7BoSGxlA |
+| 站点密码（PASSWORDS） | guochunlin2026 |
+| JWT Secret | YlLcWdd3lWmmjwrd8yWe-XakWAAOka47P_pGCwd2m-I |
+| 前端界面 | ✅ 已部署 |
+| codex-register 服务 ID | 3 |
+| codex-register site_password | guochunlin2026 |
+| 优先级 | 1 |
+| Workers Route ID | 68361d225f49480cab9c9af1e7937214 |
+| **注册测试** | ✅ 成功 — `tevbl44ecx@guochunlin.com`，验证码 4 秒，全程 13 秒 |
+
+#### 前端界面访问方式
+
+| 页面 | 地址 | 认证方式 |
+|------|------|---------|
+| **用户首页** | https://gomail.guochunlin.com | 输入站点密码 `guochunlin2026` 进入 |
+| **Admin 管理面板** | https://gomail.guochunlin.com/#/admin | 输入 Admin 密码 `en5ysQdFsUhvhG7BoSGxlA` |
+
+#### 部署特殊说明（同账号第二个域名）
+
+这个域名和 ppthub.shop 在**同一个 Cloudflare 账号**下，部署时有以下省事/不同之处：
+
+1. **Email Routing 已是 Active** — 该域名之前配过 Email Routing，MX/SPF/DKIM DNS 记录已存在，无需重新添加，**只需更新 Catch-all 规则**指向新 Worker
+2. **Catch-all 原来指向 `email-receiver-worker`** — 更新为 `temp-email-guochunlin`
+3. **gomail 子域名 DNS 需要手动创建** — `AAAA gomail.guochunlin.com -> 100:: (proxied)`
+4. **Workers Route 需要用 Global API Key 创建** — API Token 的路由设置被权限拦截，需手动：
+   ```bash
+   curl -s -X POST "https://api.cloudflare.com/client/v4/zones/【ZONE_ID】/workers/routes" \
+     -H "X-Auth-Key: 【Global_API_Key】" \
+     -H "X-Auth-Email: 【CF_登录邮箱】" \
+     -H "Content-Type: application/json" \
+     -d '{"pattern":"gomail.【域名】/*","script":"temp-email-【短名称】"}'
+   ```
+5. **前端 dist 可以复用** — 同一套前端代码，无需重新 `pnpm build`
+
+---
+
+### 已部署域名总览
+
+| # | 域名 | Worker | 服务 ID | Priority | 前端 | 状态 |
+|---|------|--------|---------|----------|------|------|
+| 1 | ppthub.shop | temp-email-ppthub | 2 | 0 | ✅ gomail.ppthub.shop | ✅ 运行中 |
+| 2 | guochunlin.com | temp-email-guochunlin | 3 | 1 | ✅ gomail.guochunlin.com | ✅ 运行中 |
+| 3 | *待部署* | — | — | 2 | — | 待定 |
+| 4 | *待部署* | — | — | 3 | — | 待定 |
+| 5 | *待部署* | — | — | 4 | — | 待定 |
+| 6 | *待部署* | — | — | 5 | — | 待定 |
+
+---
+
 ## 六、下一个域名快速部署脚本
 
 将以下信息填好后一次性运行：
@@ -626,7 +687,7 @@ API_TOKEN="cfut_新API_Token"
 GLOBAL_KEY="新Global_API_Key"
 CF_EMAIL="新CF登录邮箱"
 SITE_PASS="你的站点密码"            # 前端登录密码
-PRIORITY=1                        # 0已用于ppthub，这里填1
+PRIORITY=2                        # 0=ppthub, 1=guochunlin, 从2开始
 ADMIN_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
 JWT_SEC=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 # ===================================
