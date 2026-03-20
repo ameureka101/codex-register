@@ -94,9 +94,13 @@ Worker 名称:       temp-email-_______________
 D1 数据库名:       temp-email-_______________
 D1 数据库 ID:      _______________
 Admin 密码:        _______________   # 自己生成
+站点密码(PASSWORDS):_______________   # 前端登录密码
 JWT Secret:        _______________   # 自己生成
 Worker URL:        https://gomail._______________
+前端界面:          https://gomail._______________
+Admin 面板:        https://gomail._______________/#/admin
 codex-register 服务ID: ___
+codex-register site_password: _______________  # 同站点密码
 ```
 
 ---
@@ -154,6 +158,11 @@ routes = [
     { pattern = "gomail.【域名】", custom_domain = true },
 ]
 
+[assets]
+directory = "../frontend/dist/"
+binding = "ASSETS"
+run_worker_first = true
+
 [vars]
 TITLE = "Temp Email"
 PREFIX = ""
@@ -162,6 +171,7 @@ MAX_ADDRESS_LEN = 30
 DEFAULT_DOMAINS = ["【域名】"]
 DOMAINS = ["【域名】"]
 ADMIN_PASSWORDS = ["【Admin密码】"]
+PASSWORDS = ["【站点密码】"]
 JWT_SECRET = "【JWT_Secret】"
 BLACK_LIST = ""
 ENABLE_USER_CREATE_EMAIL = true
@@ -179,20 +189,45 @@ database_id = "【D1数据库ID】"
 - `account_id` 必须写在 toml 里 —— 否则 wrangler 会调用 `/memberships` API，这个接口需要额外权限，部署会失败报 `Authentication error [code: 10000]`
 - `routes` 配置自定义域名后，`workers.dev` 子域名会自动禁用（这是预期行为）
 - 不需要配置 RESEND（我们只收邮件，不发邮件）
+- `[assets]` 配置用于托管前端界面，必须先打包前端（见 Step 5a）
+- `PASSWORDS` 是站点访问密码（浏览器打开时需输入），保护前端不被陌生人访问
+- `ADMIN_PASSWORDS` 是管理员密码，用于 `/admin` 面板和 Admin API
 
 ---
 
-### Step 5：安装依赖
+### Step 5：安装依赖 + 打包前端
+
+**5a. 安装并打包前端（Web 界面）**
+
+```bash
+cd ~/cloudflare_temp_email/frontend
+pnpm install
+pnpm run build
+```
+
+成功输出：`✓ built in 12.57s`，并生成 `dist/` 目录（约 22 个文件）。
+
+验证打包产物：
+```bash
+ls ~/cloudflare_temp_email/frontend/dist/
+# 期望看到: index.html  assets/  favicon.ico  logo.png  sw.js 等
+```
+
+**坑：** 如果没有 pnpm，先安装：
+```bash
+which pnpm || npm install -g pnpm
+```
+
+**坑：** 如果 `pnpm install` 提示 `Ignored build scripts`，这是正常的，不影响打包。
+
+**5b. 安装 Worker 依赖**
 
 ```bash
 cd ~/cloudflare_temp_email/worker
 pnpm install
 ```
 
-**坑：** 项目要求 `pnpm`（`package.json` 里有 `packageManager: pnpm@10.10.0`），用 `npm install` 会有警告但通常也能用。建议统一用 `pnpm`：
-```bash
-which pnpm || npm install -g pnpm
-```
+**坑：** 项目要求 `pnpm`（`package.json` 里有 `packageManager: pnpm@10.10.0`），用 `npm install` 会有警告但通常也能用。
 
 ---
 
@@ -354,13 +389,19 @@ curl -s -X POST http://localhost:8000/api/email-services \
       \"base_url\": \"https://gomail.【域名】\",
       \"admin_password\": \"【Admin密码】\",
       \"domain\": \"【域名】\",
-      \"enable_prefix\": true
+      \"enable_prefix\": true,
+      \"site_password\": \"【站点密码】\"
     },
     \"enabled\": true,
     \"priority\": 【0-5，按顺序递增】
   }"
 '
 ```
+
+> **⚠️ `site_password` 字段必须填写！** 如果 wrangler.toml 配置了 `PASSWORDS`（站点访问密码），
+> 则所有 API 请求（包括 admin API）都需要带 `x-custom-auth` header。
+> codex-register 的 `temp_mail.py` 会读取 `config.site_password` 并自动添加该 header。
+> **不填此字段会导致 codex-register 无法调用 Worker API，验证码获取失败！**
 
 记录返回的 `id` 字段，然后测试：
 ```bash
@@ -410,6 +451,8 @@ curl -s -X POST "https://gomail.【域名】/admin/new_address" \
 | 10 | workers.dev 被禁用警告 | wrangler 输出 WARNING | 正常，加了 custom_domain 后 workers.dev 自动禁用 |
 | 11 | **验证码获取超时（最致命的坑）** | 注册走到第10步"等待验证码"后 120 秒超时，但 Worker 里其实已收到邮件 | **必须修复代码**，见下方详细说明 |
 | 12 | **Workspace ID 间歇性获取失败** | Step 13 `授权 Cookie 里没有 workspace 信息`，间歇性出现 | **必须修复代码**，加重试机制，见下方详细说明 |
+| 13 | **PASSWORDS 拦截 Admin API** | 配了 `PASSWORDS` 后 Admin API 返回 `please provide the password` | codex-register 配置加 `site_password`，代码自动带 `x-custom-auth` header |
+| 14 | **前端未打包就部署** | 访问 `gomail.域名` 只返回 `OK`，没有界面 | 先 `cd frontend && pnpm build` 再 deploy Worker |
 
 ### 坑 #11 详解：JWT 无 exp 字段导致验证码获取永久失败
 
@@ -539,11 +582,32 @@ gcloud compute ssh codex-register --zone=us-west1-b --command='sudo systemctl re
 | D1 数据库 ID | e8f8bf56-3f61-4d39-824b-65664a59dc1b |
 | 自定义域名 | gomail.ppthub.shop |
 | Admin 密码 | _lRwMnoL3vO6_INfMPZVFQ |
+| 站点密码（PASSWORDS） | ppthub2026 |
 | JWT Secret | UYqk1ECrqSSVp99CkBt8X2f_SrsqKesLxkgQiu5v9Wk |
+| 前端界面 | ✅ 已部署 |
 | codex-register 服务 ID | 2 |
+| codex-register site_password | ppthub2026 |
 | 优先级 | 0 |
 | wrangler.toml 路径 | ~/cloudflare_temp_email/worker/wrangler.toml |
-| **注册测试** | ✅ 成功 — `nldqm73z@ppthub.shop`，13 秒完成全流程，验证码 4 秒到达 |
+| **注册测试** | ✅ 成功 — 14 秒完成全流程，验证码 4 秒到达 |
+
+#### 前端界面访问方式
+
+| 页面 | 地址 | 认证方式 |
+|------|------|---------|
+| **用户首页** | https://gomail.ppthub.shop | 输入站点密码 `ppthub2026` 进入 |
+| **Admin 管理面板** | https://gomail.ppthub.shop/#/admin | 输入 Admin 密码 `_lRwMnoL3vO6_INfMPZVFQ` |
+
+**用户首页能做什么：**
+- 创建新邮箱地址（如 `myname@ppthub.shop`）
+- 实时查看收到的邮件和验证码
+- 删除邮件
+
+**Admin 面板能做什么：**
+- 查看所有已创建的邮箱地址
+- 查看所有收到的邮件（跨地址）
+- 管理邮箱地址（创建/删除）
+- 查看系统配置
 
 ---
 
@@ -561,18 +625,20 @@ ACCOUNT_ID="新Account_ID"
 API_TOKEN="cfut_新API_Token"
 GLOBAL_KEY="新Global_API_Key"
 CF_EMAIL="新CF登录邮箱"
+SITE_PASS="你的站点密码"            # 前端登录密码
 PRIORITY=1                        # 0已用于ppthub，这里填1
 ADMIN_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
 JWT_SEC=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 # ===================================
 
-echo "Admin 密码: $ADMIN_PASS"
-echo "JWT Secret: $JWT_SEC"
-echo "请保存以上两个值！"
+echo "Admin 密码:  $ADMIN_PASS"
+echo "站点密码:    $SITE_PASS"
+echo "JWT Secret:  $JWT_SEC"
+echo "请保存以上值！"
 echo ""
 
 # 1. 创建 D1
-echo "[1/8] 创建 D1 数据库..."
+echo "[1/9] 创建 D1 数据库..."
 D1_RESULT=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/d1/database" \
   -H "Authorization: Bearer ${API_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -580,8 +646,15 @@ D1_RESULT=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${ACC
 D1_ID=$(echo "$D1_RESULT" | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['uuid'])")
 echo "D1 ID: $D1_ID"
 
-# 2. 写 wrangler.toml
-echo "[2/8] 生成 wrangler.toml..."
+# 2. 打包前端
+echo "[2/9] 打包前端界面..."
+cd ~/cloudflare_temp_email/frontend
+pnpm install --silent 2>/dev/null
+pnpm run build 2>&1 | tail -3
+echo "前端打包完成: $(ls dist/ | wc -l) 个文件"
+
+# 3. 写 wrangler.toml
+echo "[3/9] 生成 wrangler.toml..."
 cat > ~/cloudflare_temp_email/worker/wrangler.toml <<TOML
 name = "temp-email-${SHORT}"
 main = "src/worker.ts"
@@ -593,6 +666,11 @@ routes = [
     { pattern = "gomail.${DOMAIN}", custom_domain = true },
 ]
 
+[assets]
+directory = "../frontend/dist/"
+binding = "ASSETS"
+run_worker_first = true
+
 [vars]
 TITLE = "Temp Email"
 PREFIX = ""
@@ -601,6 +679,7 @@ MAX_ADDRESS_LEN = 30
 DEFAULT_DOMAINS = ["${DOMAIN}"]
 DOMAINS = ["${DOMAIN}"]
 ADMIN_PASSWORDS = ["${ADMIN_PASS}"]
+PASSWORDS = ["${SITE_PASS}"]
 JWT_SECRET = "${JWT_SEC}"
 BLACK_LIST = ""
 ENABLE_USER_CREATE_EMAIL = true
@@ -614,18 +693,18 @@ database_name = "temp-email-${SHORT}"
 database_id = "${D1_ID}"
 TOML
 
-# 3. 部署 Worker
-echo "[3/8] 部署 Worker..."
+# 4. 部署 Worker（含前端 assets）
+echo "[4/9] 部署 Worker + 前端..."
 cd ~/cloudflare_temp_email/worker
 CLOUDFLARE_API_TOKEN="$API_TOKEN" npx wrangler deploy
 
-# 4. 初始化 DB
-echo "[4/8] 初始化数据库..."
+# 5. 初始化 DB
+echo "[5/9] 初始化数据库..."
 CLOUDFLARE_API_TOKEN="$API_TOKEN" npx wrangler d1 execute "temp-email-${SHORT}" \
   --file=../db/schema.sql --remote
 
-# 5. 查询 DKIM
-echo "[5/8] 查询 DKIM 公钥..."
+# 6. 查询 DKIM
+echo "[6/9] 查询 DKIM 公钥..."
 DKIM_CONTENT=$(curl -s "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/email/routing" \
   -H "X-Auth-Key: ${GLOBAL_KEY}" -H "X-Auth-Email: ${CF_EMAIL}" | \
   python3 -c "
@@ -637,8 +716,8 @@ for e in d['result'].get('errors',[]):
 ")
 echo "DKIM: $DKIM_CONTENT"
 
-# 6. 添加 DNS 记录
-echo "[6/8] 添加 DNS 记录..."
+# 7. 添加 DNS 记录
+echo "[7/9] 添加 DNS 记录..."
 for record in \
   "{\"type\":\"MX\",\"name\":\"${DOMAIN}\",\"content\":\"route1.mx.cloudflare.net\",\"priority\":91,\"ttl\":1}" \
   "{\"type\":\"MX\",\"name\":\"${DOMAIN}\",\"content\":\"route2.mx.cloudflare.net\",\"priority\":16,\"ttl\":1}" \
@@ -656,8 +735,8 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_recor
   -d "{\"type\":\"TXT\",\"name\":\"cf2024-1._domainkey.${DOMAIN}\",\"content\":${DKIM_CONTENT},\"ttl\":1}" | \
   python3 -c "import sys,json;d=json.load(sys.stdin);print('  DKIM:', d.get('success'), d.get('errors',''))"
 
-# 7. 启用 Email Routing + Catch-all
-echo "[7/8] 启用 Email Routing..."
+# 8. 启用 Email Routing + Catch-all
+echo "[8/9] 启用 Email Routing..."
 curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/email/routing/enable" \
   -H "X-Auth-Key: ${GLOBAL_KEY}" -H "X-Auth-Email: ${CF_EMAIL}" \
   -H "Content-Type: application/json" | \
@@ -669,8 +748,8 @@ curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/email/rout
   -d "{\"matchers\":[{\"type\":\"all\"}],\"actions\":[{\"type\":\"worker\",\"value\":[\"temp-email-${SHORT}\"]}],\"enabled\":true,\"name\":\"Catch-all\"}" | \
   python3 -c "import sys,json;d=json.load(sys.stdin);print('  Catch-all:', d.get('success'))"
 
-# 8. 注册到 codex-register
-echo "[8/8] 注册到 codex-register..."
+# 9. 注册到 codex-register（含 site_password）
+echo "[9/9] 注册到 codex-register..."
 SVC_RESULT=$(gcloud compute ssh codex-register --zone=us-west1-b --command="
 curl -s -X POST http://localhost:8000/api/email-services \
   -H 'Content-Type: application/json' \
@@ -681,7 +760,8 @@ curl -s -X POST http://localhost:8000/api/email-services \
       \"base_url\": \"https://gomail.${DOMAIN}\",
       \"admin_password\": \"${ADMIN_PASS}\",
       \"domain\": \"${DOMAIN}\",
-      \"enable_prefix\": true
+      \"enable_prefix\": true,
+      \"site_password\": \"${SITE_PASS}\"
     },
     \"enabled\": true,
     \"priority\": ${PRIORITY}
@@ -698,9 +778,12 @@ curl -s -X POST http://localhost:8000/api/email-services/${SVC_ID}/test
 echo ""
 echo "========================================"
 echo "✅ 部署完成！"
-echo "域名:      gomail.${DOMAIN}"
-echo "Admin密码: ${ADMIN_PASS}"
-echo "服务 ID:   ${SVC_ID}"
+echo "域名:       gomail.${DOMAIN}"
+echo "前端界面:   https://gomail.${DOMAIN}"
+echo "站点密码:   ${SITE_PASS}"
+echo "Admin密码:  ${ADMIN_PASS}"
+echo "Admin面板:  https://gomail.${DOMAIN}/#/admin"
+echo "服务 ID:    ${SVC_ID}"
 echo "========================================"
 ```
 
@@ -716,8 +799,11 @@ chmod +x 上面的脚本.sh && ./上面的脚本.sh
 
 每个域名完成后逐项打勾：
 
-- [ ] `curl /admin/mails` 返回 `{"results":[],"count":0}`
+- [ ] 浏览器打开 `https://gomail.域名` 看到前端登录页（输入站点密码可进入）
+- [ ] 进入后能创建邮箱地址、查看收件箱
+- [ ] 打开 `https://gomail.域名/#/admin`，输入 Admin 密码进入管理面板
+- [ ] `curl /admin/mails` 带 `x-admin-auth` + `x-custom-auth` 返回 JSON
 - [ ] `POST /admin/new_address` 返回包含 `address` 和 `jwt` 的 JSON
 - [ ] codex-register `/test` 返回 `{"success":true}`
-- [ ] 从任意邮箱发邮件到 `test@域名`，几秒后能在 Admin API 查到
+- [ ] 从任意邮箱发邮件到 `test@域名`，几秒后能在 Admin API 和前端界面查到
 - [ ] 用此服务注册 1 个 OpenAI 账号，验证码在 120 秒内收到
