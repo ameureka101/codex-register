@@ -513,61 +513,100 @@ class RegistrationEngine:
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID（含重试，应对 OpenAI 服务端竞态）"""
         import time as _time
+        import base64
+        import json as json_module
 
-        max_retries = 5
-        retry_delay = 2  # 秒
+        max_retries = 8
+        retry_delays = [1, 2, 2, 3, 3, 4, 5, 5]  # 递增等待
+
+        # 用于刷新 cookie 的 URL 列表（交替使用，增加命中率）
+        refresh_urls = [
+            "https://chatgpt.com/",
+            "https://auth.openai.com/about-you",
+            "https://chatgpt.com/api/auth/session",
+        ]
 
         for attempt in range(max_retries):
             try:
-                # 重试时重新请求一次页面以刷新 cookie
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else 5
                 if attempt > 0:
-                    self._log(f"第 {attempt + 1} 次尝试获取 Workspace ID（等待 {retry_delay}s）...")
-                    _time.sleep(retry_delay)
-                    try:
-                        self.session.get(
-                            "https://auth.openai.com/about-you",
-                            headers={"accept": "text/html"},
-                        )
-                    except Exception:
-                        pass
+                    self._log(f"第 {attempt + 1} 次尝试获取 Workspace ID（等待 {delay}s）...")
+                else:
+                    # 首次也等 1 秒，给 OpenAI 后端时间创建 workspace
+                    self._log("等待 OpenAI 后端初始化 workspace...")
+                _time.sleep(delay)
+
+                # 每次都刷新一下页面来获取最新 cookie
+                refresh_url = refresh_urls[attempt % len(refresh_urls)]
+                try:
+                    self.session.get(
+                        refresh_url,
+                        headers={"accept": "text/html,application/json"},
+                        allow_redirects=True,
+                    )
+                except Exception:
+                    pass
 
                 auth_cookie = self.session.cookies.get("oai-client-auth-session")
+                if not auth_cookie:
+                    # 尝试其他可能的 cookie 名称
+                    for cookie_name in ["__Secure-next-auth.session-token", "oai-did"]:
+                        auth_cookie = self.session.cookies.get(cookie_name)
+                        if auth_cookie:
+                            break
+
                 if not auth_cookie:
                     if attempt < max_retries - 1:
                         continue
                     self._log("未能获取到授权 Cookie", "error")
                     return None
 
-                # 解码 JWT
-                import base64
-                import json as json_module
-
                 try:
                     segments = auth_cookie.split(".")
-                    if len(segments) < 1:
-                        self._log("授权 Cookie 格式错误", "error")
-                        return None
 
                     # 遍历所有 JWT segments 寻找 workspaces
-                    for idx, seg in enumerate(segments):
+                    for seg in segments:
                         try:
                             pad = "=" * ((4 - (len(seg) % 4)) % 4)
                             decoded = base64.urlsafe_b64decode((seg + pad).encode("ascii"))
                             seg_json = json_module.loads(decoded.decode("utf-8"))
 
-                            workspaces = seg_json.get("workspaces") or []
+                            # 尝试多种可能的字段名
+                            workspaces = (
+                                seg_json.get("workspaces")
+                                or seg_json.get("workspace_ids")
+                                or seg_json.get("orgs")
+                                or []
+                            )
                             if workspaces:
-                                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+                                if isinstance(workspaces[0], dict):
+                                    workspace_id = str(
+                                        workspaces[0].get("id")
+                                        or workspaces[0].get("workspace_id")
+                                        or workspaces[0].get("org_id")
+                                        or ""
+                                    ).strip()
+                                else:
+                                    workspace_id = str(workspaces[0]).strip()
+
                                 if workspace_id:
-                                    self._log(f"Workspace ID: {workspace_id}")
+                                    self._log(f"Workspace ID: {workspace_id} (attempt {attempt + 1})")
                                     return workspace_id
+
+                            # 也检查 account_id 作为 fallback
+                            account_id = seg_json.get("account_id") or seg_json.get("sub") or ""
+                            if account_id and attempt >= max_retries - 2:
+                                # 最后两次尝试：用 account_id 作为 workspace_id（很多新账号两者相同）
+                                self._log(f"使用 account_id 作为 Workspace ID fallback: {account_id}")
+                                return str(account_id).strip()
+
                         except Exception:
                             continue
 
                     # 本轮未找到，继续重试
                     if attempt < max_retries - 1:
                         continue
-                    self._log("授权 Cookie 里没有 workspace 信息（已重试）", "error")
+                    self._log("授权 Cookie 里没有 workspace 信息（已重试 8 次）", "error")
                     return None
 
                 except Exception as e:
