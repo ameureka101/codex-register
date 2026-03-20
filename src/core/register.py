@@ -511,49 +511,74 @@ class RegistrationEngine:
             return False
 
     def _get_workspace_id(self) -> Optional[str]:
-        """获取 Workspace ID"""
-        try:
-            auth_cookie = self.session.cookies.get("oai-client-auth-session")
-            if not auth_cookie:
-                self._log("未能获取到授权 Cookie", "error")
-                return None
+        """获取 Workspace ID（含重试，应对 OpenAI 服务端竞态）"""
+        import time as _time
 
-            # 解码 JWT
-            import base64
-            import json as json_module
+        max_retries = 5
+        retry_delay = 2  # 秒
 
+        for attempt in range(max_retries):
             try:
-                segments = auth_cookie.split(".")
-                if len(segments) < 1:
-                    self._log("授权 Cookie 格式错误", "error")
+                # 重试时重新请求一次页面以刷新 cookie
+                if attempt > 0:
+                    self._log(f"第 {attempt + 1} 次尝试获取 Workspace ID（等待 {retry_delay}s）...")
+                    _time.sleep(retry_delay)
+                    try:
+                        self.session.get(
+                            "https://auth.openai.com/about-you",
+                            headers={"accept": "text/html"},
+                        )
+                    except Exception:
+                        pass
+
+                auth_cookie = self.session.cookies.get("oai-client-auth-session")
+                if not auth_cookie:
+                    if attempt < max_retries - 1:
+                        continue
+                    self._log("未能获取到授权 Cookie", "error")
                     return None
 
-                # 解码第一个 segment
-                payload = segments[0]
-                pad = "=" * ((4 - (len(payload) % 4)) % 4)
-                decoded = base64.urlsafe_b64decode((payload + pad).encode("ascii"))
-                auth_json = json_module.loads(decoded.decode("utf-8"))
+                # 解码 JWT
+                import base64
+                import json as json_module
 
-                workspaces = auth_json.get("workspaces") or []
-                if not workspaces:
-                    self._log("授权 Cookie 里没有 workspace 信息", "error")
+                try:
+                    segments = auth_cookie.split(".")
+                    if len(segments) < 1:
+                        self._log("授权 Cookie 格式错误", "error")
+                        return None
+
+                    # 遍历所有 JWT segments 寻找 workspaces
+                    for idx, seg in enumerate(segments):
+                        try:
+                            pad = "=" * ((4 - (len(seg) % 4)) % 4)
+                            decoded = base64.urlsafe_b64decode((seg + pad).encode("ascii"))
+                            seg_json = json_module.loads(decoded.decode("utf-8"))
+
+                            workspaces = seg_json.get("workspaces") or []
+                            if workspaces:
+                                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+                                if workspace_id:
+                                    self._log(f"Workspace ID: {workspace_id}")
+                                    return workspace_id
+                        except Exception:
+                            continue
+
+                    # 本轮未找到，继续重试
+                    if attempt < max_retries - 1:
+                        continue
+                    self._log("授权 Cookie 里没有 workspace 信息（已重试）", "error")
                     return None
 
-                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-                if not workspace_id:
-                    self._log("无法解析 workspace_id", "error")
+                except Exception as e:
+                    self._log(f"解析授权 Cookie 失败: {e}", "error")
                     return None
-
-                self._log(f"Workspace ID: {workspace_id}")
-                return workspace_id
 
             except Exception as e:
-                self._log(f"解析授权 Cookie 失败: {e}", "error")
+                self._log(f"获取 Workspace ID 失败: {e}", "error")
                 return None
 
-        except Exception as e:
-            self._log(f"获取 Workspace ID 失败: {e}", "error")
-            return None
+        return None
 
     def _select_workspace(self, workspace_id: str) -> Optional[str]:
         """选择 Workspace"""
